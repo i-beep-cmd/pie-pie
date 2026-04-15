@@ -63,6 +63,7 @@ Rules:
 - No mutation before a successful snapshot save.
 - Use tools for filesystem and shell actions.
 - Keep plans concise and explicit.
+- During the Plan phase, your planning response must begin with the exact prefix `Plan:`.
 - Prefer creating and editing files in `.pi/shell/`.
 - Treat `.pi/core/` as protected policy/state area.
 - If starting a new task block, begin again at Plan then Snapshot before mutation.
@@ -72,19 +73,20 @@ Rules:
 @dataclass
 class SessionState:
     phase: str = "plan"
+    plan_emitted_this_cycle: bool = False
     snapshot_saved_this_cycle: bool = False
     implementation_started: bool = False
 
     def begin_new_task_block(self) -> None:
-        progressed_in_cycle = (
-            self.snapshot_saved_this_cycle
-            or self.implementation_started
-            or self.phase in {"implement", "verify"}
-        )
-        if progressed_in_cycle:
-            self.phase = "plan"
-            self.snapshot_saved_this_cycle = False
-            self.implementation_started = False
+        self.phase = "plan"
+        self.plan_emitted_this_cycle = False
+        self.snapshot_saved_this_cycle = False
+        self.implementation_started = False
+
+    def mark_plan_emitted(self) -> None:
+        self.plan_emitted_this_cycle = True
+        if self.phase == "plan":
+            self.phase = "snapshot"
 
     def mark_snapshot_saved(self) -> None:
         self.snapshot_saved_this_cycle = True
@@ -108,6 +110,7 @@ class PiAgent:
         self.snapshot_dir = self.root / SNAPSHOT_DIR
         self.shell_dir = self.root / SHELL_DIR
         self.extensions_dir = self.root / EXTENSIONS_DIR
+        self.extensions_registry_file = self.core_dir / "extensions.json"
         self.agents_file = self.root / AGENTS_FILE
         self.state = SessionState()
         self.allow_runtime_writes = os.environ.get("PI_ALLOW_RUNTIME_WRITES", "0") == "1"
@@ -117,6 +120,8 @@ class PiAgent:
             d.mkdir(parents=True, exist_ok=True)
         if not self.agents_file.exists():
             self.agents_file.write_text(DEFAULT_AGENTS_MD, encoding="utf-8")
+        if not self.extensions_registry_file.exists():
+            self.extensions_registry_file.write_text("[]\n", encoding="utf-8")
 
     def read_agents_md(self) -> str:
         try:
@@ -156,7 +161,10 @@ class PiAgent:
             return err
         try:
             if resolved.is_dir():
-                items = sorted(p.name for p in resolved.iterdir())
+                items = []
+                for p in sorted(resolved.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
+                    kind = "[D]" if p.is_dir() else "[F]"
+                    items.append(f"{kind} {p.name}")
                 return "\n".join(items)
             return resolved.read_text(encoding="utf-8")
         except FileNotFoundError:
@@ -175,8 +183,11 @@ class PiAgent:
         if not self._is_writable_zone(resolved):
             return "ERROR: write blocked by policy. Writes are only allowed under .pi/shell/ by default."
         try:
+            is_extension_file = self._is_within(resolved, self.extensions_dir)
             resolved.parent.mkdir(parents=True, exist_ok=True)
             resolved.write_text(content, encoding="utf-8")
+            if is_extension_file and resolved.is_file():
+                self._register_extension(resolved)
             self.state.mark_mutation()
             return f"OK: wrote {resolved}"
         except Exception as exc:
@@ -204,6 +215,8 @@ class PiAgent:
         count = text.count(old_str)
         try:
             resolved.write_text(replaced, encoding="utf-8")
+            if self._is_within(resolved, self.extensions_dir):
+                self._register_extension(resolved)
             self.state.mark_mutation()
             return f"OK: edited {resolved} (replaced {count} occurrence(s))."
         except Exception as exc:
@@ -212,6 +225,7 @@ class PiAgent:
     def bash(self, cmd: str) -> str:
         if not self.state.snapshot_saved_this_cycle:
             return "ERROR: mutation/check blocked. You must call snapshot('save', <name>) after planning and before bash."
+        timeout_seconds = 25
         try:
             proc = subprocess.run(
                 cmd,
@@ -219,16 +233,158 @@ class PiAgent:
                 shell=True,
                 capture_output=True,
                 text=True,
+                timeout=timeout_seconds,
             )
             self.state.mark_verify()
             payload = {
+                "status": "ok" if proc.returncode == 0 else "error",
                 "exit_code": proc.returncode,
-                "stdout": proc.stdout,
-                "stderr": proc.stderr,
+                "stdout": self._truncate_output(proc.stdout),
+                "stderr": self._truncate_output(proc.stderr),
+                "timed_out": False,
+            }
+            return json.dumps(payload, ensure_ascii=False)
+        except subprocess.TimeoutExpired as exc:
+            payload = {
+                "status": "timeout",
+                "exit_code": None,
+                "stdout": self._truncate_output(exc.stdout if isinstance(exc.stdout, str) else ""),
+                "stderr": self._truncate_output(exc.stderr if isinstance(exc.stderr, str) else ""),
+                "timed_out": True,
+                "timeout_seconds": timeout_seconds,
             }
             return json.dumps(payload, ensure_ascii=False)
         except Exception as exc:
-            return f"ERROR: failed to execute command: {exc}"
+            payload = {
+                "status": "error",
+                "exit_code": None,
+                "stdout": "",
+                "stderr": str(exc),
+                "timed_out": False,
+            }
+            return json.dumps(payload, ensure_ascii=False)
+
+    @staticmethod
+    def _truncate_output(text: str, max_chars: int = 12000) -> str:
+        if len(text) <= max_chars:
+            return text
+        clipped = len(text) - max_chars
+        return f"{text[:max_chars]}\n...<truncated {clipped} chars>..."
+
+    def list_snapshots(self) -> str:
+        try:
+            snapshots = []
+            for archive in self.snapshot_dir.glob("*.tar.gz"):
+                stat = archive.stat()
+                snapshots.append(
+                    {
+                        "filename": archive.name,
+                        "modified_time": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+                        "size_bytes": stat.st_size,
+                    }
+                )
+            snapshots.sort(key=lambda x: x["modified_time"], reverse=True)
+            return json.dumps(snapshots, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"error": f"failed to list snapshots: {exc}"}, ensure_ascii=False)
+
+    def tree(self, path: str = SHELL_DIR, max_depth: int = 3, format: str = "text") -> str:
+        resolved, err = self._resolve_path(path or SHELL_DIR)
+        if err:
+            return err
+        if not resolved.exists():
+            return f"ERROR: path does not exist: {resolved}"
+        if not self._is_within(resolved, self.root):
+            return f"ERROR: path outside project root is not allowed: {resolved}"
+        try:
+            depth_value = int(max_depth)
+        except (TypeError, ValueError):
+            return "ERROR: max_depth must be an integer."
+        max_depth = max(0, min(depth_value, 8))
+        fmt = (format or "text").strip().lower()
+        if fmt not in {"text", "json"}:
+            return "ERROR: tree format must be 'text' or 'json'."
+        try:
+            if fmt == "json":
+                tree_json = json.dumps(self._build_tree_json(resolved, depth=0, max_depth=max_depth), ensure_ascii=False)
+                return self._truncate_output(tree_json)
+            tree_text = self._build_tree_text(resolved, depth=0, max_depth=max_depth)
+            return self._truncate_output(tree_text)
+        except Exception as exc:
+            return f"ERROR: failed to build tree for {resolved}: {exc}"
+
+    def _build_tree_json(self, path: Path, depth: int, max_depth: int) -> Dict[str, Any]:
+        node: Dict[str, Any] = {"name": path.name, "type": "dir" if path.is_dir() else "file"}
+        if not path.is_dir() or depth >= max_depth:
+            return node
+        children: List[Dict[str, Any]] = []
+        try:
+            for child in sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+                children.append(self._build_tree_json(child, depth + 1, max_depth))
+        except Exception as exc:
+            node["error"] = f"failed to iterate directory: {exc}"
+            return node
+        node["children"] = children
+        return node
+
+    def _build_tree_text(self, path: Path, depth: int, max_depth: int, prefix: str = "") -> str:
+        label = f"{path.name}/" if path.is_dir() else path.name
+        lines = [label] if depth == 0 else []
+        if not path.is_dir() or depth >= max_depth:
+            return "\n".join(lines)
+
+        try:
+            children = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        except Exception as exc:
+            lines.append(f"{prefix}└── <error: failed to iterate directory: {exc}>")
+            return "\n".join(lines)
+        for i, child in enumerate(children):
+            branch = "└── " if i == len(children) - 1 else "├── "
+            child_label = f"{child.name}/" if child.is_dir() else child.name
+            lines.append(f"{prefix}{branch}{child_label}")
+            if child.is_dir() and depth + 1 < max_depth:
+                extension = "    " if i == len(children) - 1 else "│   "
+                subtree = self._build_tree_text(child, depth + 1, max_depth, prefix + extension)
+                subtree_lines = subtree.splitlines()
+                if subtree_lines:
+                    lines.extend(subtree_lines[1:])
+        return "\n".join(lines)
+
+    def _register_extension(self, extension_path: Path) -> None:
+        rel_path = str(extension_path.relative_to(self.root))
+        now = datetime.now(timezone.utc).isoformat()
+        entries: List[Dict[str, Any]] = []
+        try:
+            if self.extensions_registry_file.exists():
+                loaded = json.loads(self.extensions_registry_file.read_text(encoding="utf-8"))
+                if isinstance(loaded, list):
+                    entries = [e for e in loaded if isinstance(e, dict)]
+        except Exception:
+            entries = []
+
+        updated = False
+        for entry in entries:
+            if entry.get("path") == rel_path:
+                if "created_at" not in entry:
+                    entry["created_at"] = now
+                entry["updated_at"] = now
+                updated = True
+                break
+        if not updated:
+            entries.append({"path": rel_path, "created_at": now, "updated_at": now})
+        self.extensions_registry_file.write_text(json.dumps(entries, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    def status(self) -> str:
+        payload = {
+            "phase": self.state.phase,
+            "plan_emitted_this_cycle": self.state.plan_emitted_this_cycle,
+            "snapshot_saved_this_cycle": self.state.snapshot_saved_this_cycle,
+            "implementation_started": self.state.implementation_started,
+            "shell_path": str(self.shell_dir),
+            "snapshot_path": str(self.snapshot_dir),
+            "extensions_registry_path": str(self.extensions_registry_file),
+        }
+        return json.dumps(payload, ensure_ascii=False)
 
     def _sanitize_snapshot_name(self, name: str) -> str:
         base = name.strip() or "snapshot"
@@ -255,6 +411,8 @@ class PiAgent:
             return "ERROR: snapshot name is required."
 
         if mode_clean == "save":
+            if not self.state.plan_emitted_this_cycle:
+                return "ERROR: snapshot save blocked. You must emit a planning response in this cycle before saving a snapshot."
             safe_name = self._sanitize_snapshot_name(name)
             archive = self.snapshot_dir / f"{safe_name}.tar.gz"
             try:
@@ -286,6 +444,7 @@ class PiAgent:
                 shutil.copytree(restored_shell, self.shell_dir)
                 self.extensions_dir.mkdir(parents=True, exist_ok=True)
                 self.state.phase = "plan"
+                self.state.plan_emitted_this_cycle = False
                 self.state.snapshot_saved_this_cycle = False
                 self.state.implementation_started = False
                 return f"OK: snapshot restored from {candidate.name}"
@@ -358,6 +517,28 @@ class PiAgent:
             {
                 "type": "function",
                 "function": {
+                    "name": "list_snapshots",
+                    "description": "List available snapshots in .pi/core/snapshots/ as JSON.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "status",
+                    "description": "Return current session workflow state and key workspace paths as JSON.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "snapshot",
                     "description": "Save/restore .pi/shell snapshots in .pi/core/snapshots as tar.gz.",
                     "parameters": {
@@ -367,6 +548,21 @@ class PiAgent:
                             "name": {"type": "string"},
                         },
                         "required": ["mode", "name"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "tree",
+                    "description": "Inspect the workspace tree. Defaults to .pi/shell/ and depth 3.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "default": SHELL_DIR},
+                            "max_depth": {"type": "integer", "default": 3},
+                            "format": {"type": "string", "enum": ["text", "json"], "default": "text"},
+                        },
                     },
                 },
             },
@@ -426,7 +622,14 @@ def tool_dispatch(agent: PiAgent) -> Dict[str, Callable[..., str]]:
             path=kw.get("path", ""), old_str=kw.get("old_str", ""), new_str=kw.get("new_str", "")
         ),
         "bash": lambda **kw: agent.bash(cmd=kw.get("cmd", "")),
+        "list_snapshots": lambda **kw: agent.list_snapshots(),
+        "status": lambda **kw: agent.status(),
         "snapshot": lambda **kw: agent.snapshot(mode=kw.get("mode", ""), name=kw.get("name", "")),
+        "tree": lambda **kw: agent.tree(
+            path=kw.get("path", SHELL_DIR),
+            max_depth=kw.get("max_depth", 3),
+            format=kw.get("format", "text"),
+        ),
     }
 
 
@@ -457,6 +660,8 @@ def run_assistant_turn(agent: PiAgent, messages: List[Dict[str, Any]]) -> Tuple[
 
         if not tool_calls:
             if content:
+                if content.strip().startswith("Plan:"):
+                    agent.state.mark_plan_emitted()
                 agent.state.mark_verify()
             return messages, content
 
