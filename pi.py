@@ -76,7 +76,12 @@ class SessionState:
     implementation_started: bool = False
 
     def begin_new_task_block(self) -> None:
-        if self.implementation_started:
+        progressed_in_cycle = (
+            self.snapshot_saved_this_cycle
+            or self.implementation_started
+            or self.phase in {"implement", "verify"}
+        )
+        if progressed_in_cycle:
             self.phase = "plan"
             self.snapshot_saved_this_cycle = False
             self.implementation_started = False
@@ -215,7 +220,7 @@ class PiAgent:
                 capture_output=True,
                 text=True,
             )
-            self.state.mark_mutation()
+            self.state.mark_verify()
             payload = {
                 "exit_code": proc.returncode,
                 "stdout": proc.stdout,
